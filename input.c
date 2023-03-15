@@ -411,7 +411,7 @@ execute_binding(struct seat *seat, struct terminal *term,
 
             term_damage_view(term);
             render_refresh(term);
-            break; 
+            break;
         }
 
         return true;
@@ -1704,6 +1704,30 @@ xcursor_for_csd_border(struct terminal *term, int x, int y)
     }
 }
 
+
+static void
+point_to_grid_location(struct terminal *term,
+                       int x, int y,
+                       int * col, int * row)
+{
+    xassert(col != NULL);
+    xassert(row != NULL);
+    /*
+     * Translate x,y pixel coordinate to a cell coordinate, or -1
+     * if the cursor is outside the grid. I.e. if it is inside the
+     * margins.
+     */
+    if (x < term->margins.left || x >= term->width - term->margins.right)
+        *col = -1;
+    else
+        *col = (x - term->margins.left) / term->cell_width;
+
+    if (y < term->margins.top || y >= term->height - term->margins.bottom)
+        *row = -1;
+    else
+        *row = (y - term->margins.top) / term->cell_height;
+}
+
 static void
 wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
                  uint32_t serial, struct wl_surface *surface,
@@ -1741,25 +1765,9 @@ wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
     term_xcursor_update_for_seat(term, seat);
 
     switch (term->active_surface) {
-    case TERM_SURF_GRID: {
-        /*
-         * Translate x,y pixel coordinate to a cell coordinate, or -1
-         * if the cursor is outside the grid. I.e. if it is inside the
-         * margins.
-         */
-
-        if (x < term->margins.left || x >= term->width - term->margins.right)
-            seat->mouse.col = -1;
-        else
-            seat->mouse.col = (x - term->margins.left) / term->cell_width;
-
-        if (y < term->margins.top || y >= term->height - term->margins.bottom)
-            seat->mouse.row = -1;
-        else
-            seat->mouse.row = (y - term->margins.top) / term->cell_height;
-
+    case TERM_SURF_GRID:
+        point_to_grid_location(term, x, y, &seat->mouse.col, &seat->mouse.row);
         break;
-    }
 
     case TERM_SURF_TITLE:
     case TERM_SURF_BORDER_LEFT:
@@ -2056,7 +2064,7 @@ wl_pointer_motion(void *data, struct wl_pointer *wl_pointer,
 }
 
 static bool
-fdm_csd_move(struct fdm *fdm, int fd, int events, void *data)
+fdm_csd_mouse_move(struct fdm *fdm, int fd, int events, void *data)
 {
     struct seat *seat = data;
     fdm_del(fdm, fd);
@@ -2073,6 +2081,61 @@ fdm_csd_move(struct fdm *fdm, int fd, int events, void *data)
     win->csd.move_timeout_fd = -1;
     xdg_toplevel_move(win->xdg_toplevel, seat->wl_seat, win->csd.serial);
     return true;
+}
+
+static bool
+fdm_csd_touch_move(struct fdm *fdm, int fd, int events, void *data)
+{
+    struct seat *seat = data;
+    fdm_del(fdm, fd);
+
+    LOG_WARN("touch move csd");
+
+    if (seat->touch_focus == NULL) {
+        LOG_WARN(
+            "%s: CSD move timeout triggered, but seat's has no touch focused terminal",
+            seat->name);
+        return true;
+    }
+
+    struct wl_window *win = seat->touch_focus->window;
+
+    win->csd.move_timeout_fd = -1;
+    xdg_toplevel_move(win->xdg_toplevel, seat->wl_seat, win->csd.serial);
+    return true;
+}
+
+static void
+start_move(struct seat *seat, struct wl_window *win, uint32_t serial,
+           bool (*callback)(struct fdm *fdm, int fd, int events, void *data))
+{
+    struct wayland *wayl = seat->wayl;
+    const struct itimerspec timeout = {
+        .it_value = {.tv_nsec = 200000000},
+    };
+
+    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (fd >= 0 &&
+        timerfd_settime(fd, 0, &timeout, NULL) == 0 &&
+        fdm_add(wayl->fdm, fd, EPOLLIN, callback, seat))
+    {
+        win->csd.move_timeout_fd = fd;
+        win->csd.serial = serial;
+    } else {
+        LOG_ERRNO("failed to configure XDG toplevel move timer FD");
+        if (fd >= 0)
+            close(fd);
+    }
+}
+
+static void
+stop_move(struct seat *seat, struct wl_window *win)
+{
+    struct wayland *wayl = seat->wayl;
+    if (win->csd.move_timeout_fd >= 0) {
+        fdm_del(wayl->fdm, win->csd.move_timeout_fd);
+        win->csd.move_timeout_fd = -1;
+    }
 }
 
 static void
@@ -2230,22 +2293,7 @@ wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
             }
 
             else if (button == BTN_LEFT && win->csd.move_timeout_fd < 0) {
-                const struct itimerspec timeout = {
-                    .it_value = {.tv_nsec = 200000000},
-                };
-
-                int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-                if (fd >= 0 &&
-                    timerfd_settime(fd, 0, &timeout, NULL) == 0 &&
-                    fdm_add(wayl->fdm, fd, EPOLLIN, &fdm_csd_move, seat))
-                {
-                    win->csd.move_timeout_fd = fd;
-                    win->csd.serial = serial;
-                } else {
-                    LOG_ERRNO("failed to configure XDG toplevel move timer FD");
-                    if (fd >= 0)
-                        close(fd);
-                }
+                start_move(seat, win, serial, fdm_csd_mouse_move);
             }
 
             if (button == BTN_RIGHT && tll_length(seat->mouse.buttons) == 1) {
@@ -2259,11 +2307,7 @@ wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
         }
 
         else if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
-            struct wl_window *win = term->window;
-            if (win->csd.move_timeout_fd >= 0) {
-                fdm_del(wayl->fdm, win->csd.move_timeout_fd);
-                win->csd.move_timeout_fd = -1;
-            }
+            stop_move(seat, term->window);
         }
         return;
 
@@ -2474,11 +2518,8 @@ alternate_scroll(struct seat *seat, int amount, int button)
 }
 
 static void
-mouse_scroll(struct seat *seat, int amount, enum wl_pointer_axis axis)
+mouse_scroll(struct terminal *term, struct seat *seat, int amount, enum wl_pointer_axis axis)
 {
-    struct terminal *term = seat->mouse_focus;
-    xassert(term != NULL);
-
     int button = axis == WL_POINTER_AXIS_VERTICAL_SCROLL
         ? amount < 0 ? BTN_BACK : BTN_FORWARD
         : amount < 0 ? BTN_WHEEL_LEFT : BTN_WHEEL_RIGHT;
@@ -2562,7 +2603,7 @@ wl_pointer_axis(void *data, struct wl_pointer *wl_pointer,
         return;
 
     int lines = seat->mouse.aggregated[axis] / seat->mouse_focus->cell_height;
-    mouse_scroll(seat, lines, axis);
+    mouse_scroll(seat->mouse_focus, seat, lines, axis);
     seat->mouse.aggregated[axis] -= (double)lines * seat->mouse_focus->cell_height;
 }
 
@@ -2580,7 +2621,7 @@ wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
     } else
         amount *= mouse_scroll_multiplier(seat->mouse_focus, seat);
 
-    mouse_scroll(seat, amount, axis);
+    mouse_scroll(seat->mouse_focus, seat, amount, axis);
 }
 
 static void
@@ -2616,4 +2657,285 @@ const struct wl_pointer_listener pointer_listener = {
     .axis_source = wl_pointer_axis_source,
     .axis_stop = wl_pointer_axis_stop,
     .axis_discrete = wl_pointer_axis_discrete,
+};
+
+// TODO move to config
+int tap_duration_ms = 150;
+int scroll_multiplier_x = 5;
+int scroll_multiplier_y = 2;
+bool touch_scroll_flip = true;
+enum selection_kind touch_select_initial_kind = SELECTION_LINE_WISE;
+
+static struct touch_point *
+find_touch_point_by_id(struct seat *seat, int32_t id)
+{
+    for (int i = 0; i < ALEN(seat->touch.points); ++i) {
+        if (seat->touch.points[i].id == id) {
+            return &seat->touch.points[i];
+        }
+    }
+    return NULL;
+}
+
+static struct touch_point *
+find_touch_point_inactive(struct seat *seat)
+{
+    for (int i = 0; i < ALEN(seat->touch.points); ++i) {
+        if (!seat->touch.points[i].active) {
+            return &seat->touch.points[i];
+        }
+    }
+    return NULL;
+}
+
+static void
+wl_touch_down(void *data, struct wl_touch *wl_touch,
+              uint32_t serial, uint32_t time,
+              struct wl_surface *surface, int32_t id,
+              wl_fixed_t x, wl_fixed_t y)
+{
+    struct seat *seat = data;
+    struct wl_window *win = wl_surface_get_user_data(surface);
+    struct terminal *term = win->term;
+
+    struct touch_point *point = find_touch_point_inactive(seat);
+    if (point == NULL) {
+        LOG_WARN("already have maximum number of touch points (%lu), "
+                 "dropping new point", ALEN(seat->touch.points));
+        seat->touch.dropped_points += 1;
+        return;
+    }
+
+    LOG_DBG("%s: touch_down: touch=%p, serial=%u, surface=%p",
+            seat->name, (void *)wl_touch, serial, (void *)surface);
+
+    point->active = true;
+    point->id = id;
+    point->x = wl_fixed_to_int(x) * term->scale;
+    point->y = wl_fixed_to_int(y) * term->scale;
+    point->timestamp = time;
+    point_to_grid_location(term, point->x, point->y,
+                           &point->col, &point->row);
+
+    term->active_surface = term_surface_kind(term, surface);
+
+    seat->touch.num_points += 1;
+    seat->touch_focus = term;
+
+    if (term->active_surface == TERM_SURF_TITLE && win->csd.move_timeout_fd < 0) {
+        start_move(seat, win, serial, fdm_csd_touch_move);
+    }
+}
+
+static void
+wl_touch_up(void *data, struct wl_touch *wl_touch,
+            uint32_t serial, uint32_t time, int32_t id)
+{
+    struct seat *seat = data;
+    struct terminal *term = seat->touch_focus;
+    xassert(seat->touch_focus);
+
+    struct touch_point *point = find_touch_point_by_id(seat, id);
+    if (point == NULL) {
+        seat->touch.dropped_points -= 1;
+        xassert(seat->touch.dropped_points >= 0);
+        return;
+    }
+
+    seat->touch.num_points -= 1;
+    xassert(seat->touch.num_points >= 0);
+
+    if (term->active_surface == TERM_SURF_GRID) {
+        if (seat->touch.state == TOUCH_STATE_NONE) {
+            selection_cancel(term);
+            term_mouse_down(
+                term, BTN_LEFT, point->row, point->col,
+                point->x - term->margins.top,
+                point->y - term->margins.left,
+                seat->kbd.shift, seat->kbd.alt, seat->kbd.ctrl);
+            term_mouse_up(
+                term, BTN_LEFT, point->row, point->col,
+                point->x - term->margins.top,
+                point->y - term->margins.left,
+                seat->kbd.shift, seat->kbd.alt, seat->kbd.ctrl);
+        } else if (seat->touch.state == TOUCH_STATE_SELECT) {
+            if (seat->touch.num_points == 0) {
+                term_mouse_up(
+                    term, BTN_LEFT, point->row, point->col,
+                    point->x - term->margins.top,
+                    point->y - term->margins.left,
+                    seat->kbd.shift, seat->kbd.alt, seat->kbd.ctrl);
+                selection_finalize(seat, term, serial);
+            } else {
+                enum selection_kind new_kind;
+                switch (term->selection.kind) {
+                    case SELECTION_CHAR_WISE:
+                        new_kind = SELECTION_LINE_WISE;
+                        break;
+                    case SELECTION_LINE_WISE:
+                        new_kind = SELECTION_BLOCK;
+                        break;
+                    default:
+                        /* fallthrough */
+                    case SELECTION_BLOCK:
+                        new_kind = SELECTION_CHAR_WISE;
+                        break;
+                }
+
+                const struct touch_point *other_point =
+                    find_touch_point_by_id(seat, seat->touch.select_initator_id);
+                xassert(other_point != NULL);
+
+                selection_cancel(term);
+                LOG_WARN("starting new select %i %i to %i %i",
+                                seat->touch.select_initial_col,
+                                seat->touch.select_initial_row,
+                                other_point->col, other_point->row
+                        );
+                selection_start(term,
+                                seat->touch.select_initial_col,
+                                seat->touch.select_initial_row,
+                                new_kind, false);
+                selection_update(term, other_point->col, other_point->row);
+            }
+        } else if (seat->touch.state == TOUCH_STATE_PASS) {
+            term_mouse_up(
+                term, BTN_LEFT, point->row, point->col,
+                point->x - term->margins.top,
+                point->y - term->margins.left,
+                seat->kbd.shift, seat->kbd.alt, seat->kbd.ctrl);
+        }
+    }
+
+    memset(point, 0, sizeof(*point));
+
+    if (seat->touch.num_points == 0) {
+        seat->touch.state = TOUCH_STATE_NONE;
+        seat->touch.select_initial_col = 0;
+        seat->touch.select_initial_row = 0;
+    }
+}
+
+static void
+wl_touch_motion(void *data, struct wl_touch *wl_touch,
+                uint32_t time, int32_t id, wl_fixed_t x, wl_fixed_t y)
+{
+    struct seat *seat = data;
+    struct terminal *term = seat->touch_focus;
+
+    int new_x = wl_fixed_to_int(x) * term->scale;
+    int new_y = wl_fixed_to_int(y) * term->scale;
+    int new_col;
+    int new_row;
+
+    struct touch_point *point = find_touch_point_by_id(seat, id);
+    if (point == NULL) {
+        xassert(seat->touch.dropped_points > 0);
+        return;
+    }
+
+    if (term->active_surface != TERM_SURF_GRID) {
+        return;
+    }
+
+    point_to_grid_location(term, new_x, new_y, &new_col, &new_row);
+
+    if (seat->touch.state == TOUCH_STATE_NONE) {
+        if (seat->touch.num_points == 1) {
+            if (time - point->timestamp > tap_duration_ms) {
+                seat->touch.state = TOUCH_STATE_SELECT;
+                seat->touch.select_initial_col =  new_col;
+                seat->touch.select_initial_row =  new_row;
+                seat->touch.select_initator_id = id;
+                selection_start(term, new_col, new_row, touch_select_initial_kind, false);
+            } else {
+                seat->touch.state = TOUCH_STATE_PASS;
+                term_mouse_down(
+                    term, BTN_LEFT, point->row, point->col,
+                    point->x - term->margins.top,
+                    point->y - term->margins.left,
+                    seat->kbd.shift, seat->kbd.alt, seat->kbd.ctrl);
+            }
+        } else if (seat->touch.num_points == 2) {
+            seat->touch.state = TOUCH_STATE_SCROLL;
+            goto exit;
+        }
+    }
+
+    if (seat->touch.state == TOUCH_STATE_SCROLL && !seat->touch.scroll_handled) {
+        int dx = (point->col - new_col) * scroll_multiplier_x;
+        int dy = (point->row - new_row) * scroll_multiplier_y;
+
+        if (touch_scroll_flip) {
+            dy = -dy;
+        }
+        if (dx != 0) {
+            mouse_scroll(term, seat,
+                         dx, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
+        }
+        if (dy != 0) {
+            mouse_scroll(term, seat,
+                         dy, WL_POINTER_AXIS_VERTICAL_SCROLL);
+        }
+        seat->touch.scroll_handled = true;
+    } else if (seat->touch.state == TOUCH_STATE_SELECT) {
+        if (id == seat->touch.select_initator_id) {
+            selection_update(term, new_col, new_row);
+        }
+    } else if (seat->touch.state == TOUCH_STATE_PASS) {
+        term_mouse_motion(term, BTN_LEFT, new_row, new_col,
+                          y - term->margins.top, x - term->margins.left,
+                          seat->kbd.shift, seat->kbd.alt, seat->kbd.ctrl);
+    }
+
+exit:
+    point->x = new_x;
+    point->y = new_y;
+    point->col = new_col;
+    point->row = new_row;
+}
+
+static void
+wl_touch_frame(void *data, struct wl_touch *wl_touch)
+{
+    struct seat *seat = data;
+    seat->touch.scroll_handled = false;
+}
+
+static void
+wl_touch_cancel(void *data, struct wl_touch *wl_touch)
+{
+    struct seat *seat = data;
+    struct terminal *term = seat->touch_focus;
+    xassert(term != NULL);
+
+    if (seat->touch.state == TOUCH_STATE_SELECT) {
+        selection_finalize(seat, term, seat->touch.serial);
+    }
+
+    memset(seat->touch.points, 0, sizeof(seat->touch.points));
+    seat->touch.num_points = 0;
+    seat->touch.state = TOUCH_STATE_NONE;
+}
+
+static void
+wl_touch_shape(void *data, struct wl_touch *wl_touch,
+               int32_t id, wl_fixed_t major, wl_fixed_t minor)
+{
+}
+
+static void
+wl_touch_orientation(void *data, struct wl_touch *wl_touch,
+                     int32_t id, wl_fixed_t orientation)
+{
+}
+
+const struct wl_touch_listener touch_listener = {
+    .down = wl_touch_down,
+    .up = wl_touch_up,
+    .motion = wl_touch_motion,
+    .frame = wl_touch_frame,
+    .cancel = wl_touch_cancel,
+    .shape = wl_touch_shape,
+    .orientation = wl_touch_orientation,
 };

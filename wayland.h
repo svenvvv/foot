@@ -82,6 +82,7 @@ struct seat {
     struct terminal *kbd_focus;
     struct terminal *mouse_focus;
     struct terminal *ime_focus;
+    struct terminal *touch_focus;
 
     /* Keyboard state */
     struct wl_keyboard *wl_keyboard;
@@ -156,6 +157,35 @@ struct seat {
         double aggregated[2];
         bool have_discrete;
     } mouse;
+
+    struct wl_touch *wl_touch;
+    struct {
+        uint32_t serial;
+        bool scroll_handled;
+
+        enum {
+            TOUCH_STATE_NONE,
+            TOUCH_STATE_SELECT,
+            TOUCH_STATE_SCROLL,
+            TOUCH_STATE_PASS,
+        } state;
+
+        struct touch_point {
+            bool active;
+            int32_t id;
+            int col;
+            int row;
+            int x;
+            int y;
+            uint32_t timestamp;
+        } points[3];
+        int num_points;
+        int dropped_points;
+
+        int32_t select_initator_id;
+        int select_initial_col;
+        int select_initial_row;
+    } touch;
 
     /* Clipboard */
     struct wl_data_device *data_device;
